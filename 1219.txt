@@ -1,0 +1,921 @@
+/*
+構成
+・射出
+　・ベルト射出
+　・ローラー射出
+　・仰角
+・ローラードリブル
+　・展開
+　・ローラー
+・アウトトリガー（足回りの操舵ねじれ解消用）
+*/
+
+#include "mbed.h"
+#include "AMT22.h"
+#include "AMT222C.h"
+#include "CommTalk.h"
+// #include "Controller.h"
+#include "Controller_gakurobo2023.h"
+#include "LpmsMe1Peach.h"
+#include "ODrive.h"
+#include "phaseCounterPeach.h"
+#include "PIDclass.h"
+#include "Platform.h"
+#include "RoboClaw_Mbed_Studio.h"
+#include "SDclass.h"
+#include "SensorComm.h"
+#include "STS_Servo.h"
+#include "TCPSocketComm.h"
+#include "UART_Module_System.h"
+#include "platform/mbed_thread.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <math.h>
+#include <string>
+#include <type_traits>
+#include <vector>
+
+//コントローラ
+#define CONCOM_INTERVAL INT_TIME*1000 // ms
+#define CONCOM_AVAILABLETIME 850 // ms
+#define JOYSTICK_DEAD_BAND 0.03
+#define NOINPUT_TIME 1.0 / INT_TIME //回数
+
+//LED
+#define LEDBLINKING_TIME 2      //回数
+#define LEDBLINKING_INTERVAL 30 // ms
+
+
+
+//サーボ用
+#define ServoID 1
+#define ServoMode 0
+#define UP_POSI 3948//1740
+#define DOWN_POSI 450//600 2600
+
+
+//射出ローラー用
+#define ROLLORE_R 0.042
+#define ENCE_PPR 500
+
+#define ENCD_PPR 500
+
+#define EJECTOR_BELT_R 0.055
+
+//仰角
+#define Ejector_Elevation_Max 120
+
+#define BELT_U 40
+#define BELT_D 40
+
+//通信
+Serial pc(USBTX, USBRX, 115200);
+Controller con(P7_4,P7_5,115200); //xbee
+
+Serial com(P8_13,P8_11,115200); //上半身との通信
+CommTalk commtalk(&com, 115200);
+
+//
+
+// SDカード
+mySDclass mySD;
+int SDcount = 0;
+int a[30000], b[30000], c[30000], d[30000];
+int A[30000], B[30000], C[30000], D[30000], E[30000], F[30000], G[30000],
+    H1[30000], I[30000], J[30000], K[30000], L4[30000], N[30000], M[30000],
+    O[30000], P[30000], Q[30000], R[30000], S[30000], T[30000], U[30000],
+    W[30000], X[30000], Y[30000];
+char str[255];
+bool flag_SDwrite = false, LED_SDwrite = false;
+
+////////////////////////モーター////////////////////////
+// CAN
+CAN ccan(CANRD, CANTD, 500000);
+ODrive ejector_motor1(&ccan, CAN_ID0);
+ODrive ejector_motor2(&ccan, CAN_ID1);
+
+// roboclawの設定
+RoboClaw robo_rollerE(ROBO1_ADDRESS, 115200, TX_PIN, RX_PIN);   // Ejector Rollor(射出用のローラー)
+RoboClaw robo_rollorD(ROBO2_ADDRESS, 115200, TX_PIN2, RX_PIN2); // Dribble Rollor(ドリブル用のローラー)
+RoboClaw robo_EP_EX  (ROBO4_ADDRESS, 115200, TX_PIN, RX_PIN);   // Ejector Ritch(射出仰角) & Expand(展開用)
+RoboClaw robo_OR     (ROBO3_ADDRESS, 115200, TX_PIN, RX_PIN);   //OutRigger用
+
+// STSサーボ
+Serial servoSerial(P8_13, P8_11); //使用するポートをインスタンス化
+STS recieve_ball(&servoSerial,115200); //クラスのインスタンス化 ボール受け機構用
+
+////////////////////////エンコーダ////////////////////////
+// AMT10
+PhaseCounter enc_recieveD(1); //ボール受け取り
+PhaseCounter enc_ejector(2); //ベルト速度監視
+
+int count_recieveD = 0;
+int count_ejector = 0;
+
+// AMT22
+SPI amt22(P10_14, P10_15, P10_12);
+AMT203V enc_expand(&amt22, P3_10);     //展開機構用
+AMT203V enc_ejectorP(&amt22, P3_11); //射出仰角用
+AMT203V enc_ejectorR(&amt22, P3_9);  //射出仰角ラッピ用
+// AMT203V enc_recieve(&amt22, P3_9);    //ボール受け取り
+// AMT203V enc_outrigger(&amt22, P3_9);   //アウトトリガー
+
+int count_expand = 0; //22展開
+int count_ejectorP = 0; //22仰角
+int count_ejectorR = 0; //22ラッピ
+int pre_count_expand = 0;
+
+////////////////////////PID///////////////////////////
+PIDGain pidgain_expand = {1.05, 0.02, 0.0}; //ドリブル展開
+PIDGain pidgain_ejector = {5, 1, 0.3}; //射出仰角
+
+PID pid_expand(pidgain_expand.Kp,pidgain_expand.Ki,pidgain_expand.Kd,INT_TIME); //ドリブル展開用
+PID pid_ejector(pidgain_ejector.Kp,pidgain_ejector.Ki,pidgain_ejector.Kd,INT_TIME); //射出仰角
+
+////////////////////////sensor////////////////////////
+// limit Switch
+DigitalIn limSW_Din(P2_9);   // ドリブル機構    格納時
+DigitalIn limSW_Dout(P2_10);  // ドリブル機構    展開時
+DigitalIn limSW_Pmax(P7_15); // 射出仰角　最大角度側
+DigitalIn limSW_Pmin(P8_1); // 射出仰角　最小角度側
+// DigitalIn limSW_Din(P8_1);   // ドリブル機構    格納時
+// DigitalIn limSW_Dout(P2_9);  // ドリブル機構    展開時
+// DigitalIn limSW_Pmax(P7_15); // 射出仰角　最大角度側
+// DigitalIn limSW_Pmin(P2_10); // 射出仰角　最小角度側
+
+bool limDin_push = false;
+bool limDout_push = false;
+bool limPmax_push = false;
+bool limPmin_push = false;
+
+// 光電センサ
+DigitalIn kouden_EB(P3_12);  // 射出機構　砲塔先端側　Back
+DigitalIn kouden_EF(P3_13);  // 射出機構　砲塔根本側　front
+DigitalIn kouden_RT(P3_14);  //ボール受け取り機構　上面側  top
+DigitalIn kouden_RB(P3_15);  //ボール受け取り機構　底面側  bottom
+
+bool kdnEB_obs = true; //反応しているとき
+bool kdnEF_obs = true;
+bool kdnRT_obs = false;
+bool kdnRB_obs = true;
+
+// on board dip
+DigitalIn dip1(P2_0);
+DigitalIn dip2(P2_1);
+DigitalIn dip3(P2_2);
+DigitalIn dip4(P2_3);
+
+// on board button
+DigitalIn user_button(USER_BUTTON0);
+DigitalIn button_0(P1_15);
+DigitalIn button_1(P1_6);
+DigitalIn button_2(P1_7);
+DigitalIn button_3(P1_13);
+
+//led
+PinName pin_led1(P4_4); // void ledBilnk(PinName,int,int) 用
+PinName pin_led2(P4_5);  // PinName で宣言しないと使えなかった
+PinName pin_led3(P4_6);
+PinName pin_led4(P4_7);
+PinName pin_USER_LED(P6_12);
+PinName pin_LED_R(P6_13);
+PinName pin_LED_G(P6_14);
+PinName pin_LED_B(P6_15);
+DigitalOut led1(P4_4);
+DigitalOut led2(P4_5);
+DigitalOut led3(P4_6);
+DigitalOut led4(P4_7);
+DigitalOut USER_LED(P6_12); //赤色に光る．
+DigitalOut LED_R(P6_13);
+DigitalOut LED_G(P6_14);
+DigitalOut LED_B(P6_15);
+
+
+Ticker flipper; // void timer_warikomi() 用
+Timer timer;
+
+bool flag_10ms = false;  //0.010s
+bool flag_100ms = false; //0.100s
+
+
+////////////////////////関数////////////////////////
+
+void timer_warikomi()
+//タイマ割り込み．　flag_inttime と flag_printを立てる
+//を立てる．RGBledも動かしている．
+{
+  static int timer_count; 
+  static uint8_t count4LED = 0;  // LED用
+  static uint8_t count4Flag = 0; // Flag用
+  count4Flag++;
+  timer_count++;
+  flag_10ms = true;
+  
+  if(timer_count > 9){
+    flag_100ms = true;
+    timer_count = 0;
+  }
+
+  if (!(count4Flag % int(PRINT_TIME / INT_TIME))) {
+    count4Flag = 0;
+    count4LED++; 
+  }
+
+  if (count4LED == 0) {
+    LED_R = true;
+    LED_G = false;
+    LED_B = false;
+  } else if (count4LED == 3) {
+    LED_G = true;
+  } else if (count4LED == 6) {
+    LED_R = false;
+  } else if (count4LED == 9) {
+    LED_B = true;
+  } else if (count4LED == 12) {
+    LED_G = false;
+  } else if (count4LED == 15) {
+    LED_R = true;
+  } else if (count4LED == 18) {
+    LED_B = false;
+    count4LED = 1;
+  }
+}
+
+void LEDblink(PinName ppin, int times, int interval)
+// led点滅用プログラム　セットアップ時に使用
+{
+  DigitalOut pin(ppin);
+  pin = 0;
+  for (int i = 0; i < times; i++) {
+    ThisThread::sleep_for(interval);
+    pin = 1;
+    ThisThread::sleep_for(interval);
+    pin = 0;
+  }
+}
+
+//値の変換用の関数////////////////////////////////////////////////////////////////////////////////
+int convert_qpps(int vel, int ppr, double d) { //rps,分解能,半径
+  // roboclawでの速度指令をQPPSで
+  int qpps = 0;
+//   qpps = double(vel * ppr) * 4.0 / (d * M_PI); //ローラーの1sごとに進む距離
+  qpps = double(vel * ppr) * 4.0 ;
+  return qpps;
+}
+
+
+
+////////////////////////機構の関数////////////////////////
+//ドリブルの展開
+//引数:状態（展開してるor展開していない），absのあたい？もしくはPWMのあたい
+// bool Dribble_expand(bool state,uint8_t cmd){
+//   if(state){
+//     if(limSW_Dout.read() == limDout_push) {
+//       robo_EP_EX.BackwardM2(0);
+//       return true;
+//     } else {
+//       robo_EP_EX.BackwardM1(cmd);
+//       return false;
+//     }
+//   } else if(!state){
+//     if(limSW_Din.read() == limDin_push) {
+//       robo_EP_EX.ForwardM2(0);
+//       return true;
+//     } else {
+//       robo_EP_EX.ForwardM1(cmd);
+//       return false;
+//     }
+//   } else {
+//     return false;
+//   }
+// }
+
+//ドリブル展開
+bool Dribble_expand(int state, int cmd){
+  if(state == 1){
+    if(count_expand < -48000){
+      robo_EP_EX.BackwardM2(0);
+      pc.printf("A");
+    }else {
+      robo_EP_EX.BackwardM2(cmd);
+
+    }
+    return true;
+  }else if(state ==2){
+    if(limSW_Din.read() == limDin_push || count_expand > 550){
+      robo_EP_EX.ForwardM2(0);
+      pc.printf("B");
+    }else {
+      robo_EP_EX.ForwardM2(cmd);
+    }
+    return true;
+  }else {
+    robo_EP_EX.ForwardM2(0);
+    return false;
+  }
+}
+
+//ドリブルローラー
+bool Dribble(int state,int cmd1,int cmd2){
+  cmd1 = int(convert_qpps(cmd1, ENCE_PPR, 2.0 * ROLLORE_R));
+  cmd2 = int(convert_qpps(cmd2, ENCE_PPR, 2.0 * ROLLORE_R));
+  if(state == 1){
+    robo_rollorD.SpeedM1(-cmd1);
+    // robo_rollorD.SpeedAccelM1(100,-cmd1);
+    robo_rollorD.SpeedM2(-cmd1);
+    // robo_rollorD.SpeedAccelM2(100,-cmd1);
+    return true;
+  } else if(state == 2){
+    recieve_ball.cmd(ServoID,DOWN_POSI,0,0);
+    return true;
+  } else if(state == 3){
+    robo_rollorD.SpeedM1(cmd2);
+    robo_rollorD.SpeedM2(cmd2);
+    return true;
+  } else if(state == 4){
+    robo_rollorD.ForwardM1(0);
+    robo_rollorD.ForwardM2(0);
+    return true;
+  } else if(state == 5){
+    recieve_ball.cmd(ServoID,2600,0,0);
+    robo_rollorD.ForwardM1(0);
+    robo_rollorD.ForwardM2(0);
+    return true;
+  } else {
+    recieve_ball.cmd(ServoID,UP_POSI,0,0);
+    robo_rollorD.ForwardM1(0);
+    robo_rollorD.ForwardM2(0);
+    return false;
+  }
+}
+
+//落とすときのサーボ
+bool Drop_ball(int state){
+  if(state %3 == 1){
+    recieve_ball.cmd(ServoID,DOWN_POSI,0,0);
+    // state = 0;
+    printf("a");
+    return true;
+  } else if(state %3 == 2){
+    recieve_ball.cmd(ServoID,UP_POSI,0,0);
+    return true;
+  } else {
+    return false;
+  }
+}
+
+
+//ドリブル機構
+bool Dribbleee(){return true;}
+
+//仰角の角度変換
+double convert_deg(int count){
+  double deg = double(count) / 16384 * 360;
+  int i_deg = 300 - int(deg);
+  return i_deg;
+}
+
+bool Ejector_Elevation(int state,int cmd,int deg){
+  if(state){
+    int vel = pid_ejector.getCmd(cmd, deg, Ejector_Elevation_Max);
+    pc.printf("%d %d %d\n",deg, cmd ,vel);
+    if(cmd < 0)
+      robo_EP_EX.BackwardM1(-vel);
+    else
+      robo_EP_EX.ForwardM1(vel);
+    return true;
+  } else {
+    robo_EP_EX.ForwardM1(0);
+    return false;
+  }
+}
+
+// main() runs in its own thread in the OS
+int main(){
+  //**********************↓setup()↓*********************************************//
+  LEDblink(pin_led1, LEDBLINKING_TIME, LEDBLINKING_INTERVAL);
+  // setup の進捗具合を表示
+
+  //不具合でリセットされたときに停止するための処理
+  printf("\nset up start\n");
+  //サーボ
+//   recieve_ball.setMode(ServoID, ServoMode);
+  printf("set Servo\n");
+  // モータの初期化
+  ejector_motor1.init(1);
+  ejector_motor2.init(1);
+  printf("set odrive\n");
+
+  ejector_motor1.setVel(0.0);
+  ejector_motor2.setVel(0.0);
+
+  ejector_motor1.servoON();
+  ejector_motor2.servoON();
+  printf("servo ON\n");
+
+  led1 = led2 = led3 = led4 = LED_G = 1; // ledを一度つける
+
+  int ledloopCount = 0;
+  //コントローラの初期化．タイムアウト時間の設定．
+  con.init(CONCOM_AVAILABLETIME, CONCOM_INTERVAL);
+  printf("wait controller\n");
+  // init関数を呼び出さなければタイムアウトの処理は行われない（available関数は常にtrueを返す）
+  do { //コントローラが繋がるまで（最低3回は点滅させる）　拡張ボタン基板のled
+    if (!dip1.read())
+      led1 = !led1;
+    if (!dip2.read())
+      led2 = !led2;
+    if (!dip3.read())
+      led3 = !led3;
+    if (!dip4.read())
+      led4 = !led4;
+    LED_G = !LED_G.read();
+    ThisThread::sleep_for(30);
+    con.update();
+    ledloopCount++;
+  } while (ledloopCount <= 5 || !con.available());
+
+  printf("set controller\n");
+
+  led1 = led2 = led3 = led4 = LED_G = 0; // ledを一度消す
+
+  LEDblink(pin_led2, LEDBLINKING_TIME,
+           LEDBLINKING_INTERVAL); // setup の進捗具合を表示
+
+  mySD.init();//SDカードクラスの初期化
+  printf("SD ok!\n");
+  printf("make logFile \n NO%d\n", mySD.make_logfile());
+  mySD.make_logfile();
+
+
+  LEDblink(pin_led3, LEDBLINKING_TIME, LEDBLINKING_INTERVAL); //
+
+  //AMT10の初期化
+  enc_recieveD.init(); //ボール受け取り
+  enc_ejector.init();  //ベルト速度監視
+
+  //AMT22の初期化
+  enc_expand.init();     //展開機構用
+  enc_ejectorP.init(); //射出仰角用
+  enc_ejectorR.init();  //射出仰角ラッピ用
+//   enc_recieve.init();    //ボール受け取り
+//   enc_outrigger.init();
+  printf("set enc\n");
+
+  pid_ejector.PIDinit(0.0, 0.0);
+  pid_expand.PIDinit(0.0, 0.0);
+  printf("set PID\n");
+
+  LEDblink(pin_led4, LEDBLINKING_TIME, LEDBLINKING_INTERVAL); //
+
+  printf("press right button\n");
+  led1 = 1;
+  led2 = led3 = led4 = 0;
+  do {  //コントローラから右ボタンの入力があるまでループ
+    con.update();
+    if (led1 == 1) {
+      led1 = 0;
+      led2 = 1;
+    } else if (led2 == 1) {
+      led2 = 0;
+      led3 = 1;
+    } else if (led3 == 1) {
+      led3 = 0;
+      led4 = 1;
+    } else if (led4 == 1) {
+      led4 = 0;
+      led1 = 1;
+    }
+    ThisThread::sleep_for(30);
+  } while ((con.getButtonState() & MASK_BUTTON_RIGHT) != MASK_BUTTON_RIGHT);
+  //}while(con.readButton_bin(RIGHT));でも可
+
+//割り込み処理の開始
+  flipper.attach(&timer_warikomi, INT_TIME);
+  printf("set timer_warikomi\n");
+
+//このプログラムでは使ってないけど，計測したいときにどうぞ
+  timer.start();
+  printf("set timer\n");
+
+  printf("loop start!!\n\n");
+
+
+  while (true) {
+    
+    bool conUp = true;//コントローラの通信の有無
+    static int buttonState = 0x0000;
+    static int addbuttonState = 0x0000;
+    static int pre_buttonState = 0x0000;
+    static bool joyAndPadState = false; //ジョイコンとパッドへの入力の有無
+    static double joyLX = 0;
+    static double joyLY = 0;
+    static double joyLRad = 0;//joystickの角度
+    static double joyLHypo = 0;//joystickLの傾き量
+    static double joyRX = 0;
+    static double joyRY = 0;
+    static int startCount = 0;
+    static int joystickAndPad_noInput_count = 0;
+
+    static int flag_DR = 0;
+    static int flag_CH = 0;
+    static int flag_SH = 0;
+    static int flag_EE = 0;
+    static int flag_DE = 0;
+    static int flag_DE_F = 0;
+    static int flag_RE = 0;
+    static uint8_t vel1 = 0;
+    static uint8_t vel2 = 0;
+    static int vel3 = 0;
+    static int vel = 0;
+
+    static int MA = 0;
+    static int BA = 0;
+    static int SA = 0;
+    static int SH = 0;
+    static int RI = 0;
+    static int pre_MA = 0;
+    static int pre_BA = 0;
+    static int pre_SA = 0;
+    static int pre_SH = 0;
+    static int pre_RI = 0;
+
+    static int UPP = 0;
+    static int DOO = 0;
+    static int pre_UPP = 0;
+    static int pre_DOO = 0;
+    static bool as = false;
+    static bool cl = false;
+
+    static int cmd1;
+    static int cmd2;
+    
+    static int off = 0;
+
+    static int sw[14];
+    static int pre_sw[14];
+
+    static int MASK_BUTTON_9 = 0, MASK_BUTTON_10 = 0;
+    static int pre_MASK_BUTTON_9 = 0, pre_MASK_BUTTON_10 = 0;
+
+    static int deg = 0;
+    static bool pre_kouden_RB = 0;
+    static bool pree_kouden_RB = 0;
+
+    uint8_t controllerSendData[4] = {};//コントローラに送るデータ
+    static int ejector_deg = 0;
+
+    static int num = 0;
+
+
+    if(flag_10ms){
+      con.update();
+      conUp = con.available();
+      if (con.getComCheck()) {
+        buttonState = con.getButtonState(); //コントローラボタンの格納
+        addbuttonState = con.addButtonState;
+
+        //値を-1~1に加工
+        joyLX = con.readJoyLX();
+        joyLY = con.readJoyLY();
+        joyRX = con.readJoyRX();
+        joyRY = con.readJoyRY();
+
+        // MASK_BUTTON_9 = con.addButtonLeft;
+        // MASK_BUTTON_10 = con.addButtonRight;
+        
+      }
+
+        sw[0] = (addbuttonState & MASK_BUTTON_0) == MASK_BUTTON_0;
+        sw[1] = (addbuttonState & MASK_BUTTON_6) == MASK_BUTTON_6; //6
+        sw[2] = (addbuttonState & MASK_BUTTON_8) == MASK_BUTTON_8; //8
+        sw[3] = (addbuttonState & MASK_BUTTON_1) == MASK_BUTTON_1; //1
+        sw[4] = (addbuttonState & MASK_BUTTON_7) == MASK_BUTTON_7; //7
+        sw[5] = (addbuttonState & MASK_BUTTON_2) == MASK_BUTTON_2; //2
+        sw[6] = (addbuttonState & MASK_BUTTON_3) == MASK_BUTTON_3; //3
+        sw[7] = (addbuttonState & MASK_BUTTON_5) == MASK_BUTTON_5; //5
+        sw[8] = (addbuttonState & MASK_BUTTON_R3) == MASK_BUTTON_R3; //12
+        sw[9] = (addbuttonState & MASK_BUTTON_4) == MASK_BUTTON_4; //4
+        sw[10] = (addbuttonState & MASK_BUTTON_11) == MASK_BUTTON_11; //11
+        sw[11] = (addbuttonState & MASK_BUTTON_9) == MASK_BUTTON_9;
+        sw[12] = (addbuttonState & MASK_BUTTON_10) == MASK_BUTTON_10;
+        sw[13] = (buttonState & MASK_BUTTON_L3) == MASK_BUTTON_L3;
+
+      count_ejector = enc_ejector.getCount();
+      count_recieveD = enc_recieveD.getCount();
+
+      count_expand = enc_expand.getRawEncount();
+      count_ejectorP = enc_ejectorP.getRawEncount();
+    //   enc_ejectorR.getRawEncount();
+      //22
+    //   count_expand = enc_expand.getEncount();
+    //   count_ejectorP = enc_ejectorP.getEncount();
+    //   count_ejectorR = enc_ejectorR.getEncount();
+
+      if(enc_expand.getRawEncount() > 13000 && pre_count_expand < 4000){
+        num--;
+      }
+      if(enc_expand.getRawEncount() < 4000 && pre_count_expand > 13000){
+        num++;
+      }
+
+      count_expand = count_expand + num*16384;
+
+      deg = convert_deg(count_ejectorP);
+
+    /////////ドリブル////////////
+      if(con.readButton(MARU) == 2){
+        flag_DR += 1;
+      }
+      
+      flag_DR = flag_DR % 6;
+
+      if(con.readButton(R1) == 1){
+        if(con.readButton(SHIKAKU) == 2)
+        flag_EE = !flag_EE; //射出仰角
+      }
+    
+    //   if(con.readButton(BATU) == 2)
+    //     flag_RE = !flag_RE;
+
+      if(con.readButton(SHIKAKU) == 2)
+        flag_CH = !flag_CH; //ベルト
+
+    //   if(con.readButton(SANKAKU) == 2)
+    //     flag_DE ++; //ドリブル展開
+
+    //   flag_DE = flag_DE%4;
+
+      if(con.readButton(L1) == 2)
+        flag_DE_F = !flag_DE_F; //ドリブル展開
+      
+    //   if(con.readButton(L1) == 1){
+    //     if(con.readButton(UP) == 2){ //受け取りサーボ
+    //       vel1 += 1;
+    //     }
+    //     if(con.readButton(DOWN) == 2){ //受け取りサーボ
+    //       vel1 -= 1;
+    //     }
+    //     if(con.readButton(SANKAKU) == 2){ //受け取りサーボ
+    //       vel2 += 1;
+    //     }
+    //     if(con.readButton(BATU) == 2){ //受け取りサーボ
+    //       vel2 -= 1;
+    //     }
+    //   }else 
+      if(con.readButton(R1) == 1){
+        if(con.readButton(UP) == 2){ //受け取りサーボ
+          vel3 += 5;
+        }
+        if(con.readButton(DOWN) == 2){ //受け取りサーボ
+          vel3 -= 5;
+        }
+        if(con.readButton(SANKAKU) == 2){ //受け取りサーボ
+          vel3 += 1;
+        }
+        if(con.readButton(BATU) == 2){ //受け取りサーボ
+          vel3 -= 1;
+        }
+      }else{
+        if(con.readButton(DOWN) == 2){
+          cl = !cl;
+        } 
+        if(con.readButton(BATU) == 2)
+          flag_RE = !flag_RE;
+        if(con.readButton(SANKAKU) == 2)
+          flag_DE ++; //ドリブル展開
+        flag_DE = flag_DE%4;
+      }
+
+        if (sw[0] == 1)
+          ejector_deg = 90;
+        else if(sw[1] == 1)
+          ejector_deg = 85;
+        else if(sw[2] == 1)
+          ejector_deg = 80;
+        else if(sw[3] == 1)
+          ejector_deg = 75;
+        else if(sw[4] == 1)
+          ejector_deg = 70;
+        else if(sw[5] == 1)
+          ejector_deg = 65;
+        else if(sw[6] == 1)
+          ejector_deg = 60;
+        else if(sw[7] == 1)
+          ejector_deg = 55;
+        else if(sw[8] == 1)
+          ejector_deg = 50;
+        else if(sw[9] == 1)
+          ejector_deg = 45;
+        else if(sw[10] == 1)
+          ejector_deg = 38;
+        // else if(sw[11] == 1)
+        //   ejector_deg = 38; 
+
+      if(conUp){
+
+        if(flag_DR == 3){
+          // if(kouden_RB.read() == !kdnRB_obs && pre_kouden_RB == kdnRB_obs){
+          if(kouden_RB == kdnRB_obs && pree_kouden_RB == false){
+            flag_DR = 4;
+            pc.printf("A\t");
+          }
+        }else if(flag_DR == 2){
+          if(pree_kouden_RB == kdnRB_obs){
+            flag_DR = 3;
+            pc.printf("A\t");
+          }
+        }
+        ////ドリブル///        
+        // Dribble(flag_DR,25,10);//3025
+        Dribble(flag_DR,23,10);//3025
+
+        // Ejector_Elevation(flag_EE,ejector_deg,deg);
+
+        // Dribble_expand(flag_DE, 10);
+        if(flag_DE_F == 1){
+          if(flag_DE == 1){
+            if(limSW_Dout.read() == limDout_push){
+              robo_EP_EX.ForwardM2(0);
+              pc.printf("A");
+            }else {
+            //   robo_EP_EX.ForwardM2(30);
+            }
+          }else if(flag_DE == 2){
+    
+            robo_rollorD.BackwardM1(25);
+            robo_rollorD.BackwardM2(25);
+          }else if(flag_DE == 3){
+            // if(limSW_Din.read() == limDin_push || count_expand > 0){
+            if(limSW_Din.read() == limDin_push){
+              robo_EP_EX.ForwardM2(0);
+              pc.printf("B");
+            }else {
+              robo_EP_EX.BackwardM2(30);
+            }
+          }else {
+            robo_EP_EX.ForwardM2(0);
+          }
+        }else{
+          robo_EP_EX.ForwardM2(0);
+          if(flag_DR == 0){
+            robo_rollorD.ForwardM1(0);
+            robo_rollorD.ForwardM2(0);
+          }
+        }
+
+        if(flag_EE){
+          if(abs(ejector_deg - deg) < 5)
+            vel = pid_ejector.getCmd(ejector_deg, deg, Ejector_Elevation_Max) * 5;
+          else if((ejector_deg - deg) > 0)
+            vel = 20;
+          else if((ejector_deg - deg) < 0)
+            vel = -20;
+          if(ejector_deg == 38 && limSW_Pmin != limPmin_push )
+            vel = -20;
+          pc.printf("%d %d %d\n",deg, ejector_deg ,vel);
+          if(vel < 0)
+            robo_EP_EX.ForwardM1(-vel);
+          else
+            robo_EP_EX.BackwardM1(vel);
+        } else {
+          robo_EP_EX.ForwardM1(0);
+        }
+
+        if(flag_RE){
+          cmd1 = int(convert_qpps(vel3, ENCE_PPR, 2.0 * ROLLORE_R));
+          if(cmd1 > 100000000)
+            cmd1 = 100000000;
+          robo_rollerE.SpeedAccelM1(cmd1/5, -cmd1);
+          robo_rollerE.SpeedAccelM2(cmd1/5, cmd1);
+        }else {
+          robo_rollerE.ForwardM1(0);
+          robo_rollerE.ForwardM2(0);
+        }
+
+        if(flag_CH == 1){
+        //   if(vel1 < BELT_U)
+        //     vel1 += 2;
+        //   else
+        //     vel1 = BELT_U;
+          
+        //   if(vel2 < BELT_D)
+        //     vel2 += 2;
+        //   else
+        //     vel2 = BELT_D;
+          vel1 = BELT_U;
+          vel2 = BELT_D;
+
+        //   ejector_motor1.setVel(-vel1);
+        //   ejector_motor2.setVel(-vel2);
+        } else {
+          if(vel1 > 5)
+            vel1 -= 5;
+          else
+            vel1 = 0;
+
+          if(vel2 > 5)
+            vel2 -= 5;
+          else
+            vel2 = 0;
+        }
+        ejector_motor1.setVel(-vel1);
+        ejector_motor2.setVel(-vel2);
+
+        if(con.readButton(LEFT) == 2){
+          as = !as;
+        }
+
+        if(as){
+          ejector_motor1.servoOFF();
+          ejector_motor2.servoOFF();
+          robo_rollerE.ForwardM1(0);
+          robo_rollerE.ForwardM2(0);
+        }
+
+        // if(con.readButton(DOWN) == 2){
+        //   cl = !cl;
+        // }
+
+        if(cl){
+          ejector_motor1.init(1);
+          ejector_motor2.init(1);
+          ejector_motor1.servoON();
+          ejector_motor2.servoON();
+        }
+
+        if(con.readButton(R1) == 2){
+          ejector_motor1.clearError();
+          ejector_motor2.clearError();
+        }
+        
+
+        ///////情報の保存//////
+        pree_kouden_RB = pre_kouden_RB;
+        pre_kouden_RB = kouden_RB.read();
+        pre_count_expand = enc_expand.getRawEncount();
+        
+
+        controllerSendData[0] = flag_DR;
+        controllerSendData[1] = flag_DE;
+        controllerSendData[2] = vel1;
+        controllerSendData[3] = vel2;
+
+        con.sendAnyByte(controllerSendData, 4);
+        robo_rollorD.ForwardM1(0);
+        robo_rollorD.ForwardM2(0);
+        robo_EP_EX.ForwardM1(0);
+        robo_EP_EX.ForwardM2(0);
+        
+
+        LEDblink(pin_led1, LEDBLINKING_TIME, LEDBLINKING_INTERVAL);
+      }else {
+        ejector_motor1.setVel(0.0);
+        ejector_motor2.setVel(0.0);
+        robo_rollerE.ForwardM1(0);
+        robo_rollerE.ForwardM2(0);
+        led1 = 1;
+        printf("NOOOOOOOOOOOOO\n");
+         
+      }
+
+      
+    //   ko = kouden_RB.read();
+      
+
+    //   Dribble(flag_DR,vel1,vel2);
+    //   Drop_ball(flag_CH);
+
+      buttonState = pre_buttonState;
+      pre_MA = MA;
+      pre_SH = SH;
+      pre_SA = SA;
+      pre_BA = BA;
+      pre_UPP = UPP;
+      pre_DOO = DOO;
+      pre_RI = RI;
+      flag_10ms = false;
+    }
+
+    if (flag_100ms) {
+    //   pc.printf("%d,%d,vel1:%d,vel2:%d,cmd1:%d,cmd2:%d\n",flag_DR,flag_CH,vel1,vel2,cmd1,cmd2);
+      pc.printf("%d,  %d , %d  vel1:%d,   vel2:%d,   vel3:%d    1:%d  \n",flag_CH,as,flag_RE,vel1,vel2,vel3,deg);
+    //   pc.printf("%d, %d\n",deg,count_ejectorP);
+    //   pc.printf("%d, %d, vel1:%d,vel2:%d\n",flag_DR,kouden_RB.read(),vel1,vel2);
+    //   pc.printf("%d, %d, %d, %d, %d, %d, %d\n",kouden_RB.read(),kouden_RT.read(),kouden_EB.read(),limSW_Din.read(),limSW_Dout.read(),limSW_Pmax.read(),limSW_Pmin.read());
+      //ko 0がボールあり                                            EB:1があり　　展開してる：limSW_Pmi：：０がおし　仰角たおれているときlimSW_Din：０がおし　　おき：limSW_Pmax.read()：０がおし
+    //   pc.printf("%d,%d,%d\n",count_expand,count_ejectorP,count_ejectorR);
+    //   pc.printf("%d,%d,%d,%d\n",limSW_Din.read(),limSW_Dout.read(),limSW_Pmax.read(),limSW_Pmin.read());
+      //仰角低い時　　格納時　　　　仰角上　　展開　0が押したとき
+    //   pc.printf("SHIKAKU:EE:%d  SANKAKU:DE:%d %d  %d %d  %d\n",flag_EE,flag_DE,count_expand,count_ejectorP,ejector_deg,deg);
+    //   for(int i = 0;i < 14; i++){
+    //     printf("%d:%d ",i,sw[i]);
+    //   }
+    //   printf("%d\n",con.readButton(R1));
+      flag_100ms = false;
+    }
+  }
+}
+
